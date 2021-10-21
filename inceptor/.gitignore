@@ -9,3 +9,5 @@ wiki
 .idea
 temp
 certs/**
+history.txt
+artifacts

@@ -9,6 +9,8 @@ using System.Threading.Tasks;
 namespace Ryu
 {
 
+    //####CODE####
+
     class Program
     {
         static void Main(string[] args)
@@ -68,7 +70,7 @@ namespace Ryu
         }
     }
 
-    //####CODE####
+
 
     class Win32
     {

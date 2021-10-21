@@ -3,6 +3,7 @@ import re
 import subprocess
 
 from compilers.Compiler import Compiler
+from compilers.CompilerExceptions import OperationNotSupported
 from config.Config import Config
 
 
@@ -38,12 +39,11 @@ class ClCompiler(Compiler):
         self.args = {
             "/permissive-": None,
             "/GS": None,
-            "/GL": None,
             "/W3": None,
             "/Gy": None,
             "/Zi": None,
             "/Gm-": None,
-            "/O2": None,
+            "/O2i": None,
             "/sdl": None,
             "/Zc:inline": None,
             "/Zc:wchar_t": None,
@@ -60,11 +60,11 @@ class ClCompiler(Compiler):
             "/WX-": None,
             "/Zc": "forScope",
             "/Gd": None,
-            "/Oi": None,
             "/MD": None,
             "/FC": None,
             "/EHsc": None,
             "/nologo": None,
+            "/Bt+": None,
             "/diagnostics": "column",
             "/LD": None,
             "/Fe": f'"{outfile}"'
@@ -73,13 +73,13 @@ class ClCompiler(Compiler):
     def default_exe_args(self, outfile):
         self.args = {
             "/permissive-": None,
+            "/Bt+": None,
             "/GS": None,
-            "/GL": None,
             "/W3": None,
             "/Gy": None,
             "/Zi": None,
             "/Gm-": None,
-            "/O2": None,
+            "/O2i": None,
             "/sdl": None,
             "/Zc:inline": None,
             "/Zc:wchar_t": None,
@@ -92,7 +92,6 @@ class ClCompiler(Compiler):
             "/WX-": None,
             "/Zc": "forScope",
             "/Gd": None,
-            "/Oi": None,
             "/MD": None,
             "/FC": None,
             "/EHsc": None,
@@ -143,7 +142,23 @@ class ClCompiler(Compiler):
     def set_libraries(self, libs: list):
         self.set_linker_options(libraries=libs)
 
-    def set_linker_options(self, outfile=None, libraries: list = None):
-        self.aargs = f'/link /DYNAMICBASE {self.format_libraries(libraries=libraries)}'
+    def hide_window(self):
+        dll = "/D \"BUILD_DLL\""
+        console = "/D \"_CONSOLE\""
+        if console in self.args.keys():
+            self.args.pop(console)
+            self.set_linker_options(other="/SUBSYSTEM:windows /ENTRY:mainCRTStartup")
+        elif dll in self.args.keys():
+            raise OperationNotSupported(
+                "DLLs don't support hidden windows at compiler level. Consider using SW_HIDE in the template"
+            )
+        return True
+
+    def set_linker_options(self, outfile=None, libraries: list = None, other=""):
+        if not self.aargs or self.aargs == "":
+            self.aargs = f'/link '
+        if libraries:
+            self.aargs = f' /DYNAMICBASE {self.format_libraries(libraries=libraries)}'
         if outfile:
             self.aargs += f' /OUT "{outfile}"'
+        self.aargs += f" {other}"

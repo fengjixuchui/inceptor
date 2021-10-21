@@ -1,27 +1,28 @@
 import os
 import shutil
 import subprocess
-import sys
 import tempfile
 import traceback
 from datetime import datetime
+from pathlib import Path
 
 from compilers.CscCompiler import CscCompiler
 from compilers.ILPacker import ILPacker
 from config.Config import Config
+from converters.Donut import ArchitectureMismatch
+from converters.TransfomerExceptions import ConversionError
 from converters.TransformerFactory import TransformerFactory
 from encoders.EncoderChain import EncoderChain
 from encoders.HexEncoder import HexEncoder
-from encoders.ZlibEncoder import ZlibEncoder
-from engine.CodeWriter import CodeWriter, TemplateFactory
+from engine.CodeWriter import CodeWriter
 from engine.Filter import Filter
-from engine.Template import Template
 from enums.Language import Language
 from generators.Generator import Generator
 from obfuscators.Obfuscator import Obfuscator
+from utils.MetaTwin import MetaTwin
 from utils.console import Console
 from utils.utils import get_project_root, file_signature, shellcode_signature, sgn
-from utils import CarbonCopy
+from signers import CarbonCopy
 
 
 class DotNetArtifactGenerator(Generator):
@@ -38,16 +39,31 @@ class DotNetArtifactGenerator(Generator):
                  pinject: bool = False,
                  process: str = None,
                  arch: str = None,
+                 classname: str = None,
+                 function: str = None,
                  sign: bool = False,
-                 modules: list = None
+                 modules: list = None,
+                 hide_window: bool = False,
+                 clone: str = None,
+                 domain: str = None,
+                 offline: bool = False,
+                 steal_from: str = None
                  ):
         super().__init__(file=file, chain=chain)
         if chain.is_empty():
             chain.push(HexEncoder())
         config = Config()
+        self.hide_window = hide_window
         self.sgn = sgn
         self.obfuscate = obfuscate
+
+        # Code Signing
         self.sign = sign
+        self.domain = domain
+        self.steal_from = steal_from
+        self.offline = offline if not steal_from else True
+
+        self.clone = Path(clone) if clone else None
 
         self.arch = None
         self.tool_arch = None
@@ -78,6 +94,11 @@ class DotNetArtifactGenerator(Generator):
             self.transformer = TransformerFactory.from_file(file=file)
 
         self.transformer.set_architecture(arch=self.arch)
+
+        # If the loader is sRDI, we'll need a class / function to convert
+        kwargs = {"classname": classname, "function": function}
+        self.transformer.set_additional_arguments(kwargs={**kwargs})
+
         self.need_parameter_module = False
         try:
             self.transformer.add_parameters(params=params)
@@ -139,9 +160,13 @@ class DotNetArtifactGenerator(Generator):
             raise FileNotFoundError("Error generating EXE")
 
     def sign_exe(self):
-        host = Config().get("SIGNING", "domain")
-        signer = CarbonCopy.CarbonCopy(verbose=False, host=host)
-        signer.sign(signee=self.outfiles["temp"], signed=self.outfiles["signed"])
+        super().sign(
+            signee=self.outfiles["temp"],
+            signed=self.outfiles["signed"],
+            clone=self.steal_from,
+            offline=self.offline,
+            domain=self.domain
+        )
         shutil.copy(self.outfiles["signed"], self.outfiles['temp'])
 
     def obfuscate_exe(self):
@@ -161,6 +186,8 @@ class DotNetArtifactGenerator(Generator):
         self.compiler.default_exe_args(outfile=self.outfiles["temp"])
         if self.dll:
             self.compiler.default_dll_args(outfile=self.outfiles["temp"])
+        elif self.hide_window:
+            self.compiler.hide_window()
         self.refresh_libraries()
         self.compiler.compile(self.writer.source_files)
         if not os.path.isfile(self.outfiles['temp']):
@@ -214,11 +241,24 @@ class DotNetArtifactGenerator(Generator):
         self.compiler.set_libraries(libs=self.writer.template.libraries)
         self.dependencies = ",".join([f'"{os.path.basename(lib)}"' for lib in self.writer.template.libraries])
 
+    def clone_metadata2(self, target: Path):
+        if not (self.clone and self.clone.is_file()):
+            return False
+        meta_twin = MetaTwin()
+        version_info = meta_twin.inspect(str(self.clone.absolute()), dump=True)
+        # Workaround for .NET assembly infromations
+        self.writer.set_assembly_info(version_info)
+
     def generate(self):
         try:
             self.generate_wrapped()
+        except (ConversionError, ArchitectureMismatch) as e:
+            Console.auto_line(f"[-] {e}")
+        except SystemExit:
+            pass
         except:
             traceback.print_exc()
+        finally:
             self.clean()
 
     def generate_wrapped(self):
@@ -263,6 +303,12 @@ class DotNetArtifactGenerator(Generator):
             Console.auto_line(f"  [>] Phase {step}.{substep}: Compiling and linking dependency files in {dep}")
         step += 1
         substep = 1
+
+        if self.clone:
+            Console.auto_line(f"[*] Phase {step}: Cloning AssemblyInfo from another binary")
+            self.clone_metadata2(Path(self.outfiles['temp']))
+            step += 1
+
         Console.auto_line(f"[*] Phase {step}: Compiling")
         self.compile_exe()
         step += 1
@@ -275,6 +321,11 @@ class DotNetArtifactGenerator(Generator):
         if self.obfuscate:
             Console.auto_line(f"[*] Phase {step}: Obfuscate dotnet binary")
             self.obfuscate_exe()
+            step += 1
+
+        if self.clone:
+            Console.auto_line(f"[*] Phase {step}: Cloning resources from another binary")
+            self.clone_metadata(Path(self.outfiles['temp']))
             step += 1
 
         if self.sign:
